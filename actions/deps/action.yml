@@ -10,8 +10,14 @@ inputs:
   outputs:
     description: Paths outside node_modules that the install creates (generated clients and the like), one per line, relative to directory. They are saved and restored with the tree; any other change outside node_modules keeps the tree from being saved.
     default: ''
+  metadata:
+    description: Save and restore pnpm's metadata cache with the tree (its offline verify needs it under a supply-chain policy). auto (when the project sets minimumReleaseAge or trustPolicy), true or false.
+    default: auto
   save:
     description: Save a new tree after a full install. A pull request from a fork never saves.
+    default: 'true'
+  store-guard:
+    description: Before a full install through the Vibernt dependency store, compare it with the public registry on a sample of the lockfile and leave it out of the job when it is slower.
     default: 'true'
 outputs:
   cache-hit:
@@ -23,6 +29,12 @@ outputs:
   key:
     description: The install identity key.
     value: ${{ steps.plan.outputs.key }}
+  registry:
+    description: After a full install through the dependency store's guard, store or public; empty when the guard did not run.
+    value: ${{ steps.install.outputs.registry }}
+  store-guard:
+    description: The guard's measurement as JSON (use, reason, sample, store and direct timings); empty when it did not run.
+    value: ${{ steps.install.outputs.store-guard }}
 runs:
   using: composite
   steps:
@@ -33,6 +45,7 @@ runs:
         INPUT_DIRECTORY: ${{ inputs.directory }}
         INPUT_MANAGER: ${{ inputs.manager }}
         INPUT_OUTPUTS: ${{ inputs.outputs }}
+        INPUT_METADATA: ${{ inputs.metadata }}
     - id: restore
       uses: actions/cache/restore@v4
       with:
@@ -43,6 +56,7 @@ runs:
       run: node "$GITHUB_ACTION_PATH/index.mjs" install
       env:
         INPUT_SAVE: ${{ inputs.save }}
+        INPUT_STORE_GUARD: ${{ inputs.store-guard }}
         VIBERNT_DEPS_HIT: ${{ steps.restore.outputs.cache-hit }}
     - if: steps.install.outputs.save == 'true'
       uses: actions/cache/save@v4
