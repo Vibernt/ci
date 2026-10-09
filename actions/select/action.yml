@@ -1,0 +1,42 @@
+name: Vibernt CI select
+description: Output the test files a pull request can affect (test impact analysis with holdout), authenticated with the job's GitHub OIDC token.
+inputs:
+  job:
+    description: The job's name in test history; use the same value in vibernt/report.
+    required: false
+  project:
+    description: Vibernt CI project id, only needed when several projects are bound to this repository.
+    required: false
+  fail-on-error:
+    description: Fail the step when selection is unavailable, instead of answering full mode.
+    default: 'false'
+  format:
+    description: How the args output names units, files (paths as they are) or go (./dir package patterns).
+    default: files
+  full-args:
+    description: The args output in full mode, for example ./... for go test. Empty by default (the runner runs everything).
+    default: ''
+  api-url:
+    description: Vibernt CI API origin.
+    default: https://ci.vibernt.ai
+  audience:
+    description: OIDC audience. Defaults to the API host.
+    required: false
+outputs:
+  mode:
+    description: quick (run files) or full (run everything; files is empty).
+  files:
+    description: Space-separated test units to run in quick mode (selected plus held out).
+  files-json:
+    description: The same units as a JSON array.
+  holdout-json:
+    description: The held-out units (a random share of the skipped ones that run anyway to measure misses).
+  args:
+    description: Runner arguments, quick mode units in the format input or full-args in full mode; pass it through an env variable, never inline.
+  count:
+    description: Number of units in quick mode.
+  reasons:
+    description: Comma-separated reason codes of a full run.
+runs:
+  using: node24
+  main: index.mjs

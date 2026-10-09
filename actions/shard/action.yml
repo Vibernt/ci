@@ -1,0 +1,96 @@
+name: Vibernt CI shard
+description: Split a job's test files across matrix legs (a fixed split by recorded duration, or fan-out where legs pull work from the run's queue), and build once (prepare the workspace in one job, restore it in each leg), authenticated with the job's GitHub OIDC token.
+inputs:
+  index:
+    description: This leg's shard (1-based), the leg's matrix value. Fixed and pull modes.
+    required: false
+  total:
+    description: The number of shards (2 to 16). Fixed mode.
+    required: false
+  pattern:
+    description: Glob(s) of the job's test files, newline-separated; {a,b} alternatives are expanded. Defaults to common test file names.
+    required: false
+  files-from:
+    description: A checked-in file listing the job's test files, one repository path per line, instead of pattern (for lists longer than an input can carry).
+    required: false
+  job:
+    description: The job's name in test history, the same on every leg; use the same value in vibernt/report.
+    required: false
+  mode:
+    description: fixed (a fixed shard count), plan (a fan-out plan job that outputs the matrix), pull (a fan-out leg that pulls its work from the run's queue), prepare (upload the workspace the job's setup steps prepared) or restore (a leg restores it instead of repeating the setup).
+    default: fixed
+  max:
+    description: Plan mode, the most legs the plan may use (1 to 50, default 16).
+    required: false
+  target:
+    description: Plan mode, the wall time the plan aims for, for example 5m.
+    required: false
+  fail-fast:
+    description: Plan mode, pull_request to stop the remaining work on a pull request's first real failure, or never.
+    required: false
+  timeout:
+    description: Plan mode, the legs' job timeout (for example 45m, default 6h); no test unit runs past it.
+    required: false
+  cost-cap:
+    description: Plan mode, the plan's expected container time at most this multiple of one leg doing the same setup and work (1 to 10, default 2).
+    required: false
+  run:
+    description: Pull mode, the test command run once for each claimed batch; {files} is replaced by the batch's test files (also in VIBERNT_FILES).
+    required: false
+  junit:
+    description: Pull mode, the JUnit report(s) the command writes (glob); each case goes to the unit whose file it names.
+    default: junit.xml
+  batch:
+    description: Pull mode, true to claim batches of units and run each batch in one invocation of run, false for one unit a claim, or the most units a claim takes (1 to 256).
+    default: 'true'
+  root:
+    description: Pull mode, the directory the test runner runs in when it is not the repository root (a package of a monorepo), so the file paths of its JUnit reports map to repository paths.
+    required: false
+  exclude:
+    description: Prepare mode, globs of workspace paths left out of the copy, newline-separated (.git, credential files, keys and caches are always left out).
+    required: false
+  max-size:
+    description: Prepare mode, the largest copy to upload (for example 300m; at most and by default 512m); a larger one is skipped and the legs set up themselves.
+    required: false
+  project:
+    description: Vibernt CI project id, only needed when several projects are bound to this repository.
+    required: false
+  fail-on-error:
+    description: Fail the step when the plan is unavailable (instead of running every file), or when no copy is saved or restored (instead of setting up).
+    default: 'false'
+  api-url:
+    description: Vibernt CI API origin.
+    default: https://ci.vibernt.ai
+  audience:
+    description: OIDC audience. Defaults to the API host.
+    required: false
+outputs:
+  files:
+    description: Space-separated test files of this leg.
+  files-json:
+    description: The same files as a JSON array.
+  count:
+    description: Number of files of this leg.
+  basis:
+    description: timing, mixed, file-count, or unavailable (every file).
+  digest:
+    description: The digest of the run's shard plan.
+  matrix:
+    description: Plan mode, the legs as a JSON list for strategy.matrix (for example [1,2,3]).
+  shards:
+    description: Plan mode, the number of legs.
+  units:
+    description: Pull mode, the units this leg ran.
+  saved:
+    description: Prepare mode, true when the prepared workspace is stored for the legs.
+  restored:
+    description: Restore mode, true when the prepared workspace was restored; run the setup steps when it is not.
+  reason:
+    description: Prepare and restore modes, why no copy was saved or restored (missing, skipped, trust, stale-commit, stale-lockfile, too-large, secret-in-workspace, ...).
+  bytes:
+    description: Prepare and restore modes, the size of the copy.
+  restore-ms:
+    description: Restore mode, the time the restore took.
+runs:
+  using: node24
+  main: index.mjs

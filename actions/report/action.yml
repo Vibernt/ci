@@ -1,0 +1,46 @@
+name: Vibernt CI report
+description: Upload JUnit results to Vibernt CI test history (flake detection and quarantine apply), authenticated with the job's GitHub OIDC token.
+inputs:
+  path:
+    description: Glob(s) of JUnit XML reports, newline- or comma-separated, relative to the workspace.
+    default: '**/junit*.xml'
+  job:
+    description: The job's name in test history. Defaults to the workflow job id; add matrix values for a matrix (one value per leg).
+    required: false
+  project:
+    description: Vibernt CI project id, only needed when several projects are bound to this repository.
+    required: false
+  shard-index:
+    description: This leg's shard index (1-based) when the job is sharded with vibernt/shard.
+    required: false
+  shard-total:
+    description: The shard count when the job is sharded with vibernt/shard.
+    required: false
+  fail-on-blocking:
+    description: Fail the step when a failing test is not quarantined.
+    default: 'true'
+  fail-if-no-reports:
+    description: Fail the step when no report matches path.
+    default: 'true'
+  api-url:
+    description: Vibernt CI API origin.
+    default: https://ci.vibernt.ai
+  audience:
+    description: OIDC audience. Defaults to the API host.
+    required: false
+outputs:
+  verdict:
+    description: passed, quarantined (every failure is quarantined) or failed.
+  tests:
+    description: Number of test results uploaded.
+  failed:
+    description: Number of failing tests.
+  blocking-failures:
+    description: Failing tests that are not quarantined.
+  quarantined-failures:
+    description: Failing tests that are quarantined.
+  run-id:
+    description: The Vibernt CI run id of this workflow run (gha_<run id>).
+runs:
+  using: node24
+  main: index.mjs

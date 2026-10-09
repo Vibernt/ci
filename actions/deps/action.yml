@@ -1,0 +1,51 @@
+name: Vibernt CI deps
+description: Optional. Restores the installed node_modules saved for the exact install identity (actions/cache, no prefix fallback), verifies it with the package manager's offline mode, or installs in full and saves the new tree. See docs/NODE_MODULES.md.
+inputs:
+  directory:
+    description: The directory that holds the lockfile, relative to the workspace.
+    default: .
+  manager:
+    description: pnpm, npm or auto (from the lockfile).
+    default: auto
+  outputs:
+    description: Paths outside node_modules that the install creates (generated clients and the like), one per line, relative to directory. They are saved and restored with the tree; any other change outside node_modules keeps the tree from being saved.
+    default: ''
+  save:
+    description: Save a new tree after a full install. A pull request from a fork never saves.
+    default: 'true'
+outputs:
+  cache-hit:
+    description: true when the exact tree was restored and verified.
+    value: ${{ steps.install.outputs.cache-hit }}
+  mode:
+    description: restored, install or fallback (a restored tree that did not verify).
+    value: ${{ steps.install.outputs.mode }}
+  key:
+    description: The install identity key.
+    value: ${{ steps.plan.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/index.mjs" plan
+      env:
+        INPUT_DIRECTORY: ${{ inputs.directory }}
+        INPUT_MANAGER: ${{ inputs.manager }}
+        INPUT_OUTPUTS: ${{ inputs.outputs }}
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.plan.outputs.paths }}
+        key: ${{ steps.plan.outputs.key }}
+    - id: install
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/index.mjs" install
+      env:
+        INPUT_SAVE: ${{ inputs.save }}
+        VIBERNT_DEPS_HIT: ${{ steps.restore.outputs.cache-hit }}
+    - if: steps.install.outputs.save == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.plan.outputs.paths }}
+        key: ${{ steps.plan.outputs.key }}
