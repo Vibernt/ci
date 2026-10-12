@@ -17,7 +17,7 @@ inputs:
     description: Save a new tree after a full install. A pull request from a fork never saves.
     default: 'true'
   store-guard:
-    description: Before a full install through the Vibernt dependency store, compare it with the public registry on a sample of the lockfile and leave it out of the job when it is slower.
+    description: Before a full install through the Vibernt dependency store, compare its R2 path with the public registry on a random sample of the lockfile (48 tarballs, seeded by the job) and leave it out of the job unless it took at most 0.8x the registry's time.
     default: 'true'
 outputs:
   cache-hit:
@@ -33,7 +33,7 @@ outputs:
     description: After a full install through the dependency store's guard, store or public; empty when the guard did not run.
     value: ${{ steps.install.outputs.registry }}
   store-guard:
-    description: The guard's measurement as JSON (use, reason, sample, store and direct timings); empty when it did not run.
+    description: The guard's measurement as JSON (use, reason, sample, seed, store and direct timings, where the store's answers came from); empty when it did not run.
     value: ${{ steps.install.outputs.store-guard }}
 runs:
   using: composite

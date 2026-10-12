@@ -128,9 +128,12 @@ async function plan(job) {
     setOutput('digest', result.digest);
     const s = ms => `${Math.round((ms || 0) / 1000)} s`;
     info(`Fan-out plan: ${result.shards} leg(s), ${files.length} test file(s), expected wall ${s(result.expected?.wallMs)} against ${s(result.expected?.singleWallMs)} on one leg, per-leg overhead ${s(result.overheadMs)} (setup included), cost ${result.cost?.ratio ?? '?'}x one leg.`);
+    // Why this many legs (benchmark 2026-10-12, finding 4): the rule that set the count and what limited it.
+    if (result.count?.reason)
+        info(`Fan-out legs: ${result.count.reason}`);
     if (result.history?.estimate)
         info(result.history.estimate);
-    summary(`### Vibernt CI fan-out plan\n\n${result.shards} legs for ${files.length} test files (${result.basis}). Expected wall ${s(result.expected?.wallMs)}, one leg ${s(result.expected?.singleWallMs)}; per-leg overhead ${s(result.overheadMs)}. Plan ${result.digest}.`);
+    summary(`### Vibernt CI fan-out plan\n\n${result.shards} legs for ${files.length} test files (${result.basis}). Expected wall ${s(result.expected?.wallMs)}, one leg ${s(result.expected?.singleWallMs)}; per-leg overhead ${s(result.overheadMs)}.${result.count?.reason ? ` Legs: ${result.count.reason}` : ''} Plan ${result.digest}.`);
 }
 
 /** Runs the leg's command for a batch's files: `{ code, timedOut, stopped }`. */

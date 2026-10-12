@@ -16,10 +16,11 @@
  * restored with the tree: the offline verify reads it (without it pnpm stops with ERR_PNPM_NO_OFFLINE_META).
  *
  * Its only network calls are the dependency store's guard before a full install: when the job's registry is the Vibernt
- * dependency store, a sample of the lockfile's tarballs is fetched from the public registry and through the store, and
- * a store that is slower (or fails, or serves other bytes) is left out of the rest of the job.
+ * dependency store, a random sample of the lockfile's tarballs (seeded by the job) is fetched from the public registry
+ * and through the store's R2 path, and a store that is not clearly faster (or fails, or serves other bytes) is left out
+ * of the rest of the job.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -238,12 +239,49 @@ export function runnerPaths(env = process.env, workspace = env.GITHUB_WORKSPACE)
     const out = [workspace, env.RUNNER_WORKSPACE, env.RUNNER_TEMP, env.RUNNER_TEMP && resolve(env.RUNNER_TEMP, '..'), env.RUNNER_TOOL_CACHE, env.AGENT_TOOLSDIRECTORY];
     return [...new Set(out.filter(p => typeof p === 'string' && isAbsolute(p)).map(p => resolve(p)))];
 }
+/** A command's first line of output when it exits 0, else null (the package managers' own answers about themselves). */
+function answer(argv, cwd, env) {
+    const result = spawnSync(argv[0], argv.slice(1), { cwd, encoding: 'utf8', timeout: 20000, env: { ...env, COREPACK_ENABLE_DOWNLOAD_PROMPT: '0', COREPACK_ENABLE_NETWORK: '0' } });
+    const value = (result.stdout || '').trim().split('\n').pop()?.trim();
+    return result.status === 0 && value && value !== 'undefined' && value !== 'null' ? value : null;
+}
+/**
+ * Where the package managers keep their own store and caches for this job, as the tools themselves answer with the
+ * job's environment and the project's configuration: `pnpm store path` and pnpm's cache directory (pnpm projects),
+ * `npm config get cache`, and `yarn cache dir` when a yarn answers. pnpm/setup v2 puts pnpm's store at
+ * ~/setup-pnpm/store/v11, outside the fixed names of HOME_CACHES (benchmark 2026-10-12, finding 1): an install's
+ * writes there are the package manager's, not side effects. Absolute paths only; `homeSkips` decides which count.
+ */
+export function managerDirs(manager, dir, env = process.env, run = answer, lookup = configValue) {
+    const out = [];
+    if (manager === 'pnpm') {
+        out.push(run(['pnpm', 'store', 'path'], dir, env));
+        out.push(pnpmCacheDir(dir, env, process.platform, lookup));
+    }
+    out.push(run(['npm', 'config', 'get', 'cache'], dir, env));
+    out.push(run(['yarn', 'cache', 'dir'], dir, env));
+    return [...new Set(out.filter(p => typeof p === 'string' && isAbsolute(p)).map(p => resolve(p)))];
+}
+/**
+ * The package-manager directories (`managerDirs`) that the home walk skips, relative to the home: only a path strictly
+ * inside the home, never the home itself, and never one that holds the workspace or a runner directory (a store
+ * configured at ~ or ~/actions-runner would otherwise hide every write the install makes there). A path outside the
+ * home is never walked, so the job choosing one changes nothing.
+ */
+export function homeSkips(home, dirs, guarded = []) {
+    const root = resolve(home);
+    const rel = p => relative(root, resolve(p)).split(sep).join('/');
+    const inside = r => r && r !== '.' && !r.startsWith('../') && r !== '..' && !isAbsolute(r);
+    const kept = guarded.map(rel).filter(inside);
+    return [...new Set(dirs.filter(p => typeof p === 'string' && isAbsolute(p)).map(rel).filter(r => inside(r) && !kept.some(k => k === r || k.startsWith(`${r}/`))))].sort();
+}
 /**
  * Type, size and mtime of every path outside node_modules (workspace, .git/objects left out) and of what an install can
- * write in the home: everything but the package-manager caches, the workspace and the runner's own directories (its
+ * write in the home: everything but the package-manager caches (the fixed names of HOME_CACHES and `skips`, the
+ * package managers' own configured directories from `homeSkips`), the workspace and the runner's own directories (its
  * _diag logs, its _work root with every workspace, temp and tool cache), which a runner keeps under the home.
  */
-export function snapshot(workspace, home, env = process.env) {
+export function snapshot(workspace, home, env = process.env, skips = []) {
     const seen = new Map();
     const record = (label, root, skipRel = new Set()) => walk(root, (rel, entry) => {
         if (skipRel.has(rel) || rel === '.git/objects')
@@ -267,7 +305,7 @@ export function snapshot(workspace, home, env = process.env) {
     if (home && existsSync(home)) {
         const root = resolve(home);
         const runner = runnerPaths(env, workspace).map(p => relative(root, p)).filter(r => r && !r.startsWith('..') && !isAbsolute(r)).map(r => r.split(sep).join('/'));
-        record('home', root, new Set([...HOME_CACHES, ...runner]));
+        record('home', root, new Set([...HOME_CACHES, ...runner, ...homeSkips(root, skips, runnerPaths(env, workspace))]));
     }
     return seen;
 }
@@ -298,7 +336,20 @@ export function fromFork(env = process.env) {
 }
 /* ----- The dependency store's guard (docs/DEPENDENCY_STORE.md "The guard") ----- */
 const STORE_MARK = '# Vibernt dependency store';
-const SAMPLE = 16, CONCURRENCY = 8, ARM_TIMEOUT_MS = 30000;
+/**
+ * 48 tarballs, 8 in flight, at most 30 s per arm. The store is kept only when it took at most `keepRatio` of the
+ * registry's time on the same tarballs (clearly faster, not merely as fast: an install of thousands of tarballs went
+ * slower than its sample suggested; benchmark 2026-10-12, finding 2).
+ */
+export const GUARD = Object.freeze({ sample: 48, concurrency: 8, armTimeoutMs: 30000, keepRatio: 0.8 });
+const SAMPLE = GUARD.sample, CONCURRENCY = GUARD.concurrency, ARM_TIMEOUT_MS = GUARD.armTimeoutMs;
+/**
+ * The store's request header that asks it to answer by the path an install takes for a tarball the colo does not hold:
+ * the colo's cache is neither read nor filled for that request (src/services/dependency-store.mjs). Without it the
+ * guard's own fetches put its sample in the colo's cache, and the next job in that location measured the colo instead
+ * of R2 (benchmark 2026-10-12, finding 2: 5 of 5 `as-fast` decisions wrong).
+ */
+export const PROBE_HEADER = 'x-vibernt-store-probe';
 /**
  * The dependency store the runner configured in the job user's npmrc: { file, registry, token, lines }, or null. Only a
  * file the runner wrote (its marker comment, a `registry=` ending in /npm/ and that URL's own token) counts.
@@ -322,8 +373,22 @@ export function storeConfig(env = process.env) {
     const tokenLine = lines.find(l => l.startsWith(`${nerf}:_authToken=`));
     return tokenLine ? { file, registry, token: tokenLine.slice(nerf.length + 12).trim(), lines } : null;
 }
-/** [{name, version, sha512 hex}] from the lockfile, registry packages with a sha512 integrity, spread evenly. */
-export function lockfileSample(dir, manager, limit = SAMPLE) {
+/**
+ * The seed of this job's sample: the workflow run, its attempt, the job and the runner (a drop-in runner's name is
+ * unique to its job), so every job draws other tarballs; a random one when none of these is set. Logged with the
+ * decision, so a sample can be drawn again.
+ */
+export function sampleSeed(env = process.env) {
+    const parts = [env.GITHUB_RUN_ID, env.GITHUB_RUN_ATTEMPT, env.GITHUB_JOB, env.RUNNER_NAME].filter(Boolean).map(String);
+    return parts.length ? parts.join('.').replace(/[^\w.-]/g, '_').slice(0, 200) : randomBytes(8).toString('hex');
+}
+/**
+ * [{name, version, sha512 hex}] from the lockfile: registry packages with a sha512 integrity, `limit` of them drawn at
+ * random over the whole lockfile by `seed` (the same seed draws the same sample, another seed another one). Until
+ * 2026-10-12 the sample was spread evenly over the sorted lockfile, so every job of a repository fetched the same
+ * tarballs and the colo's cache came to hold exactly those.
+ */
+export function lockfileSample(dir, manager, limit = SAMPLE, seed = sampleSeed()) {
     const entries = [];
     const text = readFileSync(join(dir, MANAGERS[manager].lockfile), 'utf8');
     if (manager === 'pnpm') {
@@ -357,24 +422,31 @@ export function lockfileSample(dir, manager, limit = SAMPLE) {
                 entries.push([path.split('node_modules/').pop(), String(spec.version || ''), String(spec.integrity).split(/\s+/)[0]]);
         }
     }
-    const unique = [...new Map(entries.map(e => [e.join('\u0000'), e])).values()].sort((a, b) => (a.join('\u0000') < b.join('\u0000') ? -1 : 1));
-    const step = unique.length / limit;
-    const spread = unique.length <= limit ? unique : Array.from({ length: limit }, (_, i) => unique[Math.floor(i * step)]);
-    return spread.map(([name, v, integrity]) => ({ name, version: v, hex: Buffer.from(integrity.slice(7), 'base64').toString('hex') })).filter(x => x.version && x.hex.length === 128);
+    const unique = [...new Map(entries.map(e => [e.join('\u0000'), e])).values()];
+    // A seeded draw without replacement: each entry ranks by the hash of the seed and the entry.
+    const ranked = unique.map(e => [sha256(`${seed}\u0000${e[0]}@${e[1]}`), e]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return ranked.slice(0, limit).map(([, [name, v, integrity]]) => ({ name, version: v, hex: Buffer.from(integrity.slice(7), 'base64').toString('hex') })).filter(x => x.version && x.hex.length === 128);
 }
 export const tarballUrl = (registry, name, v) => `${registry.replace(/\/+$/, '')}/${name}/-/${encodeURIComponent(name.split('/').pop())}-${encodeURIComponent(v)}.tgz`;
-/** Fetches every sampled tarball from `registry`, CONCURRENCY at a time, hashing each: wall time, bytes, failures. */
+/**
+ * Fetches every sampled tarball from `registry`, CONCURRENCY at a time, hashing each: wall time, bytes, failures, and
+ * where the store said each answer came from (`x-vibernt-store`: edge = the colo's cache, hit = R2, miss, pass).
+ */
 export async function measure(registry, sample, headers = {}, timeoutMs = ARM_TIMEOUT_MS) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = performance.now();
     const queue = [...sample];
+    const sources = {};
     let ok = 0, bytes = 0, mismatched = 0;
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
         while (queue.length) {
             const item = queue.shift();
             try {
-                const response = await fetch(tarballUrl(registry, item.name, item.version), { headers: { 'user-agent': 'vibernt-deps-store-guard/1', ...headers }, signal: controller.signal });
+                const response = await fetch(tarballUrl(registry, item.name, item.version), { headers: { 'user-agent': 'vibernt-deps-store-guard/2', ...headers }, signal: controller.signal });
+                const source = response.headers.get('x-vibernt-store');
+                if (source && /^[a-z]{1,12}$/.test(source))
+                    sources[source] = (sources[source] || 0) + 1;
                 if (!response.ok) {
                     await response.body?.cancel().catch(() => { });
                     continue;
@@ -392,24 +464,31 @@ export async function measure(registry, sample, headers = {}, timeoutMs = ARM_TI
     }));
     clearTimeout(timer);
     const seconds = (performance.now() - started) / 1000;
-    return { seconds: Number(seconds.toFixed(3)), tarballs: ok, bytes, failed: sample.length - ok, mismatched, bytesPerSecond: seconds > 0 ? Math.round(bytes / seconds) : 0 };
+    return { seconds: Number(seconds.toFixed(3)), tarballs: ok, bytes, failed: sample.length - ok, mismatched, bytesPerSecond: seconds > 0 ? Math.round(bytes / seconds) : 0, ...(Object.keys(sources).length ? { sources } : {}) };
 }
-/** Whether to install through the store: { use, reason, sample, store?, direct? } (as runner/store_probe.py). */
-export async function storeDecision(store, sample, direct = PUBLIC_REGISTRY, measureFn = measure) {
+/**
+ * Whether to install through the store: { use, reason, sample, seed?, store?, direct? } (as runner/store_probe.py). The
+ * store is asked for its R2 path (PROBE_HEADER) and kept only when it took at most `keepRatio` of the registry's time
+ * (`faster`); otherwise it is left out: `slower` (longer than the registry) or `not-faster` (within the ratio).
+ */
+export async function storeDecision(store, sample, direct = PUBLIC_REGISTRY, measureFn = measure, { keepRatio = GUARD.keepRatio, seed = null } = {}) {
+    const about = seed ? { seed } : {};
     if (!sample.length)
-        return { use: true, reason: 'no-sample', sample: 0 };
+        return { use: true, reason: 'no-sample', sample: 0, ...about };
     const first = await measureFn(direct, sample, {});
     if (first.tarballs === 0)
-        return { use: true, reason: 'registry-unavailable', sample: sample.length, direct: first };
-    const through = await measureFn(store.registry, sample, { authorization: `Bearer ${store.token}` });
-    const out = { sample: sample.length, store: through, direct: first };
+        return { use: true, reason: 'registry-unavailable', sample: sample.length, ...about, direct: first };
+    const through = await measureFn(store.registry, sample, { authorization: `Bearer ${store.token}`, [PROBE_HEADER]: '1' });
+    const out = { sample: sample.length, ...about, store: through, direct: first };
     if (through.mismatched)
         return { use: false, reason: 'integrity', ...out };
     if (through.failed > first.failed)
         return { use: false, reason: 'errors', ...out };
     if (through.seconds > first.seconds)
         return { use: false, reason: 'slower', ...out };
-    return { use: true, reason: 'as-fast', ...out };
+    if (through.seconds > keepRatio * first.seconds)
+        return { use: false, reason: 'not-faster', ...out };
+    return { use: true, reason: 'faster', ...out };
 }
 /**
  * Before a full install: the guard, when the job's registry is the dependency store. Returns the variables the install
@@ -428,15 +507,17 @@ export async function guardStore(state, env = process.env, { direct = env.VIBERN
         return {};
     }
     let decision;
+    const seed = sampleSeed(env);
     try {
-        decision = await storeDecision(store, lockfileSample(state.dir, state.manager), direct, measureFn);
+        decision = await storeDecision(store, lockfileSample(state.dir, state.manager, SAMPLE, seed), direct, measureFn, { seed });
     }
     catch {
-        decision = { use: true, reason: 'probe-error', sample: 0 };
+        decision = { use: true, reason: 'probe-error', sample: 0, seed };
     }
     setOutput('store-guard', JSON.stringify(decision));
     const host = new URL(direct).host;
-    const numbers = decision.store ? `${decision.sample} lockfile tarballs: store ${decision.store.seconds.toFixed(2)} s (${decision.store.failed} failed), ${host} ${decision.direct.seconds.toFixed(2)} s (${decision.direct.failed} failed)` : decision.reason;
+    const sources = decision.store?.sources ? `, answered from ${Object.entries(decision.store.sources).map(([k, n]) => `${k} ${n}`).join(', ')}` : '';
+    const numbers = decision.store ? `${decision.sample} lockfile tarballs drawn with seed ${decision.seed}: store ${decision.store.seconds.toFixed(2)} s (${decision.store.failed} failed${sources}), ${host} ${decision.direct.seconds.toFixed(2)} s (${decision.direct.failed} failed); kept only at ${GUARD.keepRatio}x or less` : `${decision.reason}; seed ${decision.seed}`;
     if (decision.use) {
         setOutput('registry', 'store');
         info(`vibernt/deps: dependency store kept (${decision.reason}; ${numbers}).`);
@@ -497,7 +578,11 @@ export async function install(env = process.env) {
     }
     const extraEnv = await guardStore(state, env);
     const home = env.HOME;
-    const before = snapshot(state.workspace, home, env);
+    // The package managers' own store and caches, as they answer for this job (with the guard's registry choice).
+    const own = home ? homeSkips(home, managerDirs(state.manager, state.dir, { ...env, ...extraEnv }), runnerPaths(env, state.workspace)) : [];
+    if (own.length)
+        info(`vibernt/deps: the package managers' own directories under the home are not side effects: ${own.map(p => `~/${p}`).join(', ')}.`);
+    const before = snapshot(state.workspace, home, env, own.map(p => join(home, p)));
     const result = await execute(commands.install, state.dir, extraEnv);
     setOutput('cache-hit', 'false');
     setOutput('mode', mode);
@@ -505,7 +590,7 @@ export async function install(env = process.env) {
         setOutput('save', 'false');
         throw new Error(`${commands.install.join(' ')} failed (exit ${result.code}).`);
     }
-    const effects = sideEffects(before, snapshot(state.workspace, home, env), state.outputs);
+    const effects = sideEffects(before, snapshot(state.workspace, home, env, own.map(p => join(home, p))), state.outputs);
     const save = mode === 'install' && effects.length === 0 && booleanInput('save', true) && !fromFork(env);
     if (effects.length)
         warning(`The install changed files outside node_modules (${effects.join(', ')}); the tree is not saved. Declare generated paths in outputs.`);
