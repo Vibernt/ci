@@ -2,7 +2,8 @@
  * vibernt/deps (optional, docs/NODE_MODULES.md#drop-in-jobs): installed node_modules by exact install identity for
  * GitHub Actions jobs, on drop-in runners or anywhere else. The composite action.yml wraps actions/cache: this script
  * computes the key and the paths (`plan`), then verifies a restored tree with the package manager's offline mode or
- * installs in full and decides whether the new tree may be saved (`install`). The same rules as native jobs
+ * installs in full and decides whether the new tree may be saved (`install`), and after the save says what became of
+ * it (`report`). The same rules as native jobs
  * (runner/nodemodules.py): no prefix fallback, a restored tree that does not verify is replaced by a full install,
  * an install that changes anything outside node_modules and the declared outputs is never saved, and a fork's pull
  * request never saves. Node 24, no dependencies.
@@ -596,7 +597,63 @@ export async function install(env = process.env) {
         warning(`The install changed files outside node_modules (${effects.join(', ')}); the tree is not saved. Declare generated paths in outputs.`);
     else if (fromFork(env))
         info('A pull request from a fork: the tree is not saved.');
+    else if (mode === 'fallback')
+        info('vibernt/deps: the restored tree did not verify and was installed in full; that tree is not saved over the entry it replaced (entries are immutable).');
+    else if (!save)
+        info('vibernt/deps: save is false; the tree is not saved.');
     setOutput('save', save ? 'true' : 'false');
 }
+/** The Vibernt cache proxy of a drop-in runner, as the runner's .env points actions at it, or null. */
+export function cacheProxyBase(env = process.env) {
+    const base = env.ACTIONS_RESULTS_URL || '';
+    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/$/.test(base) ? base : null;
+}
+/**
+ * What became of the save (security review 0.4.7, H1): on a drop-in runner the service scopes a write by the job GitHub
+ * runs on the runner, which is not always the job the runner was started for, and the runner's cache proxy keeps each
+ * save's outcome (runner/actions-cache-proxy.mjs, GET /vibernt/saves). Says whether the tree was saved, under which
+ * job's scope when GitHub swapped this job onto another job's runner, or why it was not. Elsewhere (GitHub's cache) the
+ * save step's own log says it. Never fails the job.
+ */
+export async function report(env = process.env, fetchImpl = fetch) {
+    const key = env.VIBERNT_DEPS_KEY || '';
+    const base = cacheProxyBase(env);
+    if (!key || !base)
+        return null;
+    let outcome = null;
+    try {
+        const response = await fetchImpl(new URL(`vibernt/saves?key=${encodeURIComponent(key)}`, base), { signal: AbortSignal.timeout(5000) });
+        outcome = response.status === 200 || response.status === 404 ? await response.json() : null;
+        if (!outcome) {
+            info('vibernt/deps: this runner\'s cache proxy does not report saves (an older runner image); see the save step\'s log.');
+            return null;
+        }
+    }
+    catch {
+        info('vibernt/deps: the runner\'s cache proxy did not answer; see the save step\'s log.');
+        return null;
+    }
+    const line = describeSave(key, outcome);
+    (line.level === 'warning' ? warning : info)(line.text);
+    return line;
+}
+/** One line for a save's outcome as the proxy kept it (`{ reserve, finalize }`, each `{ ok, message }`). */
+export function describeSave(key, outcome) {
+    const denied = text => String(text || '').replace(/^cache write denied:\s*/, '');
+    const reserve = outcome?.reserve, finalize = outcome?.finalize;
+    if (!reserve)
+        return { saved: false, level: 'info', text: `vibernt/deps: no save of ${key} reached the cache (the save step did not run, or failed before it asked).` };
+    if (!reserve.ok) {
+        if (/^cache write denied:/.test(reserve.message || ''))
+            return { saved: false, level: 'warning', text: `vibernt/deps: ${key} was not saved: ${denied(reserve.message)}.` };
+        return { saved: false, level: 'info', text: `vibernt/deps: ${key} was not saved: another job saved it or is saving it${reserve.message ? ` (${reserve.message})` : ''}.` };
+    }
+    if (!finalize)
+        return { saved: false, level: 'warning', text: `vibernt/deps: ${key} was reserved but its upload did not finish; see the save step's log.` };
+    if (!finalize.ok)
+        return { saved: false, level: 'warning', text: `vibernt/deps: ${key} was not saved: ${denied(finalize.message) || 'the cache refused to finish the entry'}.` };
+    const scope = finalize.message || reserve.message;
+    return { saved: true, level: 'info', text: `vibernt/deps: saved ${key}${scope ? `, ${scope}` : ''}.` };
+}
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]))
-    main(() => (process.argv[2] === 'plan' ? plan() : process.argv[2] === 'install' ? install() : Promise.reject(new Error('Usage: index.mjs plan|install'))));
+    main(() => (process.argv[2] === 'plan' ? plan() : process.argv[2] === 'install' ? install() : process.argv[2] === 'report' ? report() : Promise.reject(new Error('Usage: index.mjs plan|install|report'))));

@@ -63,3 +63,10 @@ runs:
       with:
         path: ${{ steps.plan.outputs.paths }}
         key: ${{ steps.plan.outputs.key }}
+    # What became of the save on a drop-in runner: saved (under which job's scope, when GitHub ran this job on a runner
+    # started for another), or why not. Elsewhere it prints nothing; it never fails the job.
+    - if: always() && steps.install.outputs.save == 'true'
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/index.mjs" report
+      env:
+        VIBERNT_DEPS_KEY: ${{ steps.plan.outputs.key }}
