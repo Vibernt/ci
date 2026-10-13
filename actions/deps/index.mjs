@@ -620,17 +620,27 @@ export async function report(env = process.env, fetchImpl = fetch) {
     const base = cacheProxyBase(env);
     if (!key || !base)
         return null;
-    let outcome = null;
+    let response;
     try {
-        const response = await fetchImpl(new URL(`vibernt/saves?key=${encodeURIComponent(key)}`, base), { signal: AbortSignal.timeout(5000) });
-        outcome = response.status === 200 || response.status === 404 ? await response.json() : null;
-        if (!outcome) {
-            info('vibernt/deps: this runner\'s cache proxy does not report saves (an older runner image); see the save step\'s log.');
-            return null;
-        }
+        response = await fetchImpl(new URL(`vibernt/saves?key=${encodeURIComponent(key)}`, base), { signal: AbortSignal.timeout(5000) });
     }
     catch {
         info('vibernt/deps: the runner\'s cache proxy did not answer; see the save step\'s log.');
+        return null;
+    }
+    // An older proxy has no /vibernt/saves and passes the path on to GitHub, whose answer is not our JSON.
+    let outcome = null;
+    if (response.status === 200 || response.status === 404) {
+        try {
+            const parsed = JSON.parse(await response.text());
+            outcome = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        }
+        catch {
+            outcome = null;
+        }
+    }
+    if (!outcome) {
+        info('vibernt/deps: this runner\'s cache proxy does not report saves (an older runner image); see the save step\'s log.');
         return null;
     }
     const line = describeSave(key, outcome);
